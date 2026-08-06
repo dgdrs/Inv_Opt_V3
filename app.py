@@ -25,6 +25,9 @@ except ImportError:
     from visualizer import ScenarioVisualizer
 
 
+BUDGET_MONTHS = [f"M_{i:02d}" for i in range(1, 13)]
+
+
 class InventoryOptimizerApp:
     def __init__(self, root):
         self.root = root
@@ -36,6 +39,15 @@ class InventoryOptimizerApp:
         self.data_generator = SampleDataGenerator()
         self.calculator = InventoryCalculator(self.settings)
         self.visualizer = ScenarioVisualizer(self.settings)
+
+        # Budget settings: Total Monthly Budget (€) + % split per Product
+        # Family, editable/savable via the "Budget" tab (budget_settings.json).
+        # This is the single source of truth for self.budget_data below, which
+        # every scenario treats as a MAXIMUM: As-Is reports deviations against
+        # it, and the Constraint scenario optimizes safety days to stay
+        # within it. Populated for real once data is loaded (see process_data
+        # / _sync_budget_tab_with_families).
+        self.budget_settings = self.load_budget_settings()
         
         # Data storage
         self.input_file = None
@@ -56,6 +68,14 @@ class InventoryOptimizerApp:
         self.inspector_fields = {}
         self.inspector_computed_vars = {}
         self.inspector_canvas = None
+
+        # Budget tab state
+        self.budget_month_vars = {}
+        self.budget_family_split_vars = {}
+        self.budget_split_sum_var = None
+        self.budget_split_sum_label = None
+        self.budget_split_inner = None
+        self.budget_preview_tree = None
         
         # Create GUI
         self.create_widgets()
@@ -115,6 +135,35 @@ class InventoryOptimizerApp:
             messagebox.showinfo("Success", "Settings saved successfully!")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save settings: {e}")
+
+    # ------------------------------------------------------------------
+    # Budget settings persistence (Total Monthly Budget + Family % split)
+    # ------------------------------------------------------------------
+
+    def load_budget_settings(self):
+        """Load previously saved Budget-tab settings (Total Monthly Budget +
+        Family % split) from budget_settings.json, if it exists. Returns None
+        if there's nothing saved yet -- callers then fall back to deriving
+        defaults from whatever data file gets loaded."""
+        budget_file = "budget_settings.json"
+        try:
+            if os.path.exists(budget_file):
+                with open(budget_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"Error loading budget settings: {e}")
+        return None
+
+    def save_budget_settings(self):
+        """Persist the current Total Monthly Budget + Family % split to
+        budget_settings.json so it survives an app restart or a fresh data
+        load."""
+        budget_file = "budget_settings.json"
+        try:
+            with open(budget_file, 'w', encoding='utf-8') as f:
+                json.dump(self.budget_settings, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save budget settings: {e}")
     
     def create_widgets(self):
         """Create all GUI elements"""
@@ -192,13 +241,15 @@ class InventoryOptimizerApp:
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=5)
         
-        # Scenario tabs
+        # Tabs
+        self.tab_budget = ttk.Frame(self.notebook)
         self.tab_as_is = ttk.Frame(self.notebook)
         self.tab_constraint = ttk.Frame(self.notebook)
         self.tab_optimized = ttk.Frame(self.notebook)
         self.tab_comparison = ttk.Frame(self.notebook)
         self.tab_inspector = ttk.Frame(self.notebook)
         
+        self.notebook.add(self.tab_budget, text="Budget")
         self.notebook.add(self.tab_as_is, text="As-Is Scenario")
         self.notebook.add(self.tab_constraint, text="Constraint Scenario")
         self.notebook.add(self.tab_optimized, text="Optimized Scenario")
@@ -206,6 +257,7 @@ class InventoryOptimizerApp:
         self.notebook.add(self.tab_inspector, text="SKU Inspector")
         
         # Setup tabs
+        self.setup_budget_tab()
         self.setup_as_is_tab()
         self.setup_constraint_tab()
         self.setup_optimized_tab()
@@ -232,6 +284,280 @@ class InventoryOptimizerApp:
         
         # Update calculator with new settings
         self.calculator = InventoryCalculator(self.settings)
+
+    # ------------------------------------------------------------------
+    # Budget tab: Total Monthly Budget (€) + % split per Product Family
+    # ------------------------------------------------------------------
+
+    def setup_budget_tab(self):
+        """Budget tab: edit the Total Monthly Budget and how it's split (%)
+        across Product Families. This is the single source of truth for
+        self.budget_data, which every scenario treats as a MAXIMUM -- the
+        As-Is scenario reports deviations against it, and the Constraint
+        scenario optimizes safety days to stay within it. Family rows are
+        (re)built once data is loaded (see _sync_budget_tab_with_families),
+        since the family list isn't known yet at widget-creation time."""
+        container = ttk.Frame(self.tab_budget, padding="10")
+        container.pack(fill=tk.BOTH, expand=True)
+
+        intro = ttk.Label(
+            container,
+            text=("Set the Total Monthly Budget and how it is split (%) across Product Families. "
+                  "This budget is treated as a MAXIMUM: the As-Is scenario reports deviations against "
+                  "it, and the Constraint scenario optimizes safety days to stay within it. "
+                  "Click 'Apply & Save Budget' to persist your changes, then the main 'Recalculate' "
+                  "button to flow them into all three scenarios."),
+            wraplength=1400, justify=tk.LEFT
+        )
+        intro.pack(fill=tk.X, pady=(0, 10))
+
+        body = ttk.Frame(container)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # --- Total monthly budget (editable) ---
+        total_frame = ttk.LabelFrame(body, text="Total Monthly Budget (€)", padding="10")
+        total_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+
+        for r, month in enumerate(BUDGET_MONTHS):
+            ttk.Label(total_frame, text=month + ":").grid(row=r, column=0, sticky=tk.W, pady=2)
+            var = tk.StringVar(value="0")
+            ttk.Entry(total_frame, textvariable=var, width=14).grid(row=r, column=1, sticky=tk.W, pady=2, padx=5)
+            self.budget_month_vars[month] = var
+
+        # --- Family % split (editable) ---
+        split_frame = ttk.LabelFrame(body, text="Family Split (%)", padding="10")
+        split_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+
+        self.budget_split_inner = ttk.Frame(split_frame)
+        self.budget_split_inner.pack(fill=tk.BOTH, expand=True)
+
+        self.budget_split_sum_var = tk.StringVar(value="Sum: -")
+        self.budget_split_sum_label = ttk.Label(split_frame, textvariable=self.budget_split_sum_var,
+                                                 font=('Helvetica', 9, 'italic'))
+        self.budget_split_sum_label.pack(pady=(8, 0), anchor=tk.W)
+
+        btn_frame = ttk.Frame(split_frame)
+        btn_frame.pack(pady=(12, 0), anchor=tk.W)
+        ttk.Button(btn_frame, text="Apply & Save Budget", command=self.apply_budget_settings,
+                   style="Accent.TButton").pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="Reset from Data", command=self.reset_budget_from_data).pack(side=tk.LEFT, padx=3)
+
+        # --- Resulting per-family/month budget (read-only preview) ---
+        preview_frame = ttk.LabelFrame(body, text="Resulting Budget per Family / Month (preview)", padding="10")
+        preview_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        columns = ["Family"] + BUDGET_MONTHS
+        tree_container = ttk.Frame(preview_frame)
+        tree_container.pack(fill=tk.BOTH, expand=True)
+
+        self.budget_preview_tree = ttk.Treeview(tree_container, columns=columns, show='headings', height=10)
+        for col in columns:
+            self.budget_preview_tree.heading(col, text=col)
+            width = 120 if col == "Family" else 78
+            anchor = tk.W if col == "Family" else tk.E
+            self.budget_preview_tree.column(col, width=width, anchor=anchor)
+
+        vsb = ttk.Scrollbar(tree_container, orient="vertical", command=self.budget_preview_tree.yview)
+        hsb = ttk.Scrollbar(preview_frame, orient="horizontal", command=self.budget_preview_tree.xview)
+        self.budget_preview_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.budget_preview_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.LEFT, fill=tk.Y)
+        hsb.pack(fill=tk.X)
+
+    def _update_budget_split_sum(self):
+        """Live-updates the 'Sum: X%' readout next to the Family Split
+        fields, and colors it green/red depending on how close it is to the
+        required 100%."""
+        total = 0.0
+        for var in self.budget_family_split_vars.values():
+            try:
+                total += float(var.get())
+            except ValueError:
+                pass
+        if self.budget_split_sum_var is not None:
+            self.budget_split_sum_var.set(f"Sum: {total:.1f}%  (target 100%)")
+        if self.budget_split_sum_label is not None:
+            color = "#1a7f37" if abs(total - 100) < 0.5 else "#b3261e"
+            self.budget_split_sum_label.configure(foreground=color)
+
+    def _derive_budget_defaults_from_raw(self, budget_df):
+        """Build a monthly_total_eur / family_split_pct dict from a raw
+        (un-pivoted) Budget dataframe (columns: Product_Family, Month,
+        Budget_EUR) -- i.e. whatever came in on the loaded Excel file's own
+        Budget tab. Used to seed sensible defaults the first time, or when
+        'Reset from Data' is clicked. Falls back to an equal split across the
+        currently loaded families if no budget data is available."""
+        monthly_total = {m: 0.0 for m in BUDGET_MONTHS}
+        family_split = {}
+
+        if budget_df is not None and not budget_df.empty and 'Budget_EUR' in budget_df.columns:
+            totals_by_month = budget_df.groupby('Month')['Budget_EUR'].sum()
+            for m in BUDGET_MONTHS:
+                monthly_total[m] = float(totals_by_month.get(m, 0.0))
+
+            grand_total = float(budget_df['Budget_EUR'].sum())
+            by_family = budget_df.groupby('Product_Family')['Budget_EUR'].sum()
+            for family in self.families:
+                family = str(family)
+                if grand_total > 0:
+                    family_split[family] = float(by_family.get(family, 0.0)) / grand_total * 100.0
+                else:
+                    family_split[family] = 100.0 / max(len(self.families), 1)
+        else:
+            equal_share = 100.0 / max(len(self.families), 1)
+            for family in self.families:
+                family_split[str(family)] = equal_share
+
+        # Normalize splits to sum exactly 100 (guards against float drift /
+        # families with zero historical budget)
+        total_pct = sum(family_split.values())
+        if total_pct > 0:
+            family_split = {k: v * 100.0 / total_pct for k, v in family_split.items()}
+
+        return {'monthly_total_eur': monthly_total, 'family_split_pct': family_split}
+
+    def _recompute_budget_data_from_settings(self):
+        """Recompute self.budget_data (the pivoted Family x Budget_M_xx
+        DataFrame every scenario reads) from self.budget_settings' Total
+        Monthly Budget + Family % split."""
+        rows = []
+        for family in self.families:
+            family = str(family)
+            split = self.budget_settings['family_split_pct'].get(family, 0.0)
+            for m in BUDGET_MONTHS:
+                total = self.budget_settings['monthly_total_eur'].get(m, 0.0)
+                rows.append({'Product_Family': family, 'Month': m, 'Budget_EUR': total * split / 100.0})
+
+        if not rows:
+            return
+        budget_long = pd.DataFrame(rows)
+        self.budget_data = budget_long.pivot(
+            index='Product_Family', columns='Month', values='Budget_EUR'
+        ).add_prefix('Budget_')
+
+    def _sync_budget_tab_with_families(self):
+        """(Re)build the Family Split (%) rows to match the currently loaded
+        families, and populate the Budget tab either from a previously saved
+        budget_settings.json (if its family set still matches) or -- the
+        first time, or after loading a file with a different family set --
+        from the loaded data's own Budget tab as sensible defaults. Always
+        ends by recomputing self.budget_data so scenarios immediately use
+        whatever is showing on the Budget tab."""
+        if not hasattr(self, 'budget_month_vars') or not self.budget_month_vars:
+            return
+
+        settings_families = set(self.budget_settings['family_split_pct'].keys()) if self.budget_settings else set()
+        current_families = set(str(f) for f in self.families)
+
+        if self.budget_settings is None or settings_families != current_families:
+            self.budget_settings = self._derive_budget_defaults_from_raw(self.data.get('Budget'))
+
+        # Populate Total Monthly Budget fields
+        for month in BUDGET_MONTHS:
+            val = self.budget_settings['monthly_total_eur'].get(month, 0.0)
+            self.budget_month_vars[month].set(f"{val:.2f}")
+
+        # Rebuild Family Split rows
+        for widget in self.budget_split_inner.winfo_children():
+            widget.destroy()
+        self.budget_family_split_vars = {}
+        for r, family in enumerate(self.families):
+            family = str(family)
+            ttk.Label(self.budget_split_inner, text=family + ":").grid(row=r, column=0, sticky=tk.W, pady=2)
+            var = tk.StringVar(value=f"{self.budget_settings['family_split_pct'].get(family, 0.0):.1f}")
+            entry = ttk.Entry(self.budget_split_inner, textvariable=var, width=10)
+            entry.grid(row=r, column=1, sticky=tk.W, pady=2, padx=5)
+            entry.bind('<KeyRelease>', lambda e: self._update_budget_split_sum())
+            self.budget_family_split_vars[family] = var
+
+        self._update_budget_split_sum()
+        self._recompute_budget_data_from_settings()
+        self.refresh_budget_preview()
+
+    def refresh_budget_preview(self):
+        """Refresh the read-only 'Resulting Budget per Family / Month'
+        preview table from self.budget_data."""
+        if self.budget_preview_tree is None:
+            return
+        for item in self.budget_preview_tree.get_children():
+            self.budget_preview_tree.delete(item)
+        if self.budget_data is None:
+            return
+        for family in self.families:
+            family = str(family)
+            if family not in self.budget_data.index:
+                continue
+            values = []
+            for m in BUDGET_MONTHS:
+                col = f'Budget_{m}'
+                values.append(f"{self.budget_data.loc[family, col]:,.0f}" if col in self.budget_data.columns else "-")
+            self.budget_preview_tree.insert('', tk.END, values=[family] + values)
+
+    def apply_budget_settings(self):
+        """Validate and persist the edited Total Monthly Budget + Family
+        Split fields, recompute self.budget_data (the MAXIMUM every scenario
+        reads), and save to budget_settings.json so it survives a restart /
+        a fresh data load."""
+        try:
+            monthly_total = {m: float(self.budget_month_vars[m].get()) for m in BUDGET_MONTHS}
+            if any(v < 0 for v in monthly_total.values()):
+                raise ValueError("values must be zero or positive")
+        except ValueError as e:
+            messagebox.showerror("Invalid input", f"Please check the Total Monthly Budget values: {e}")
+            return
+
+        try:
+            family_split = {f: float(v.get()) for f, v in self.budget_family_split_vars.items()}
+            if any(v < 0 for v in family_split.values()):
+                raise ValueError("values must be zero or positive")
+        except ValueError as e:
+            messagebox.showerror("Invalid input", f"Please check the Family Split values: {e}")
+            return
+
+        total_pct = sum(family_split.values())
+        if abs(total_pct - 100.0) > 0.5:
+            proceed = messagebox.askyesno(
+                "Splits don't sum to 100%",
+                f"Family split percentages sum to {total_pct:.1f}%, not 100%.\n\n"
+                f"Auto-normalize proportionally to 100% and continue?"
+            )
+            if not proceed:
+                return
+            if total_pct > 0:
+                family_split = {f: v * 100.0 / total_pct for f, v in family_split.items()}
+            else:
+                equal = 100.0 / max(len(family_split), 1)
+                family_split = {f: equal for f in family_split}
+
+        self.budget_settings = {'monthly_total_eur': monthly_total, 'family_split_pct': family_split}
+        self.save_budget_settings()
+        self._recompute_budget_data_from_settings()
+        self.refresh_budget_preview()
+
+        # Reflect (possibly normalized) split values back into the entry fields
+        for f, var in self.budget_family_split_vars.items():
+            var.set(f"{family_split.get(f, 0):.1f}")
+        self._update_budget_split_sum()
+
+        self.status_var.set(
+            "Budget applied and saved to budget_settings.json. Click 'Recalculate' to flow it into all scenarios."
+        )
+        messagebox.showinfo(
+            "Budget saved",
+            "Budget saved. Click the main 'Recalculate' button to re-run all scenarios against the new budget."
+        )
+
+    def reset_budget_from_data(self):
+        """Discard any saved budget_settings.json values and recompute the
+        Total Monthly Budget / Family Split fields fresh from the currently
+        loaded data file's own Budget tab. Not saved until 'Apply & Save
+        Budget' is clicked afterwards."""
+        if self.processed_data is None:
+            return
+        self.budget_settings = self._derive_budget_defaults_from_raw(self.data.get('Budget'))
+        self._sync_budget_tab_with_families()
+        self.status_var.set("Budget fields reset from loaded data (not yet saved -- click 'Apply & Save Budget' to persist).")
     
     def load_file(self):
         """Load Excel file with multiple tabs"""
@@ -336,6 +662,15 @@ class InventoryOptimizerApp:
             if self.all_skus and not self.inspector_sku_var.get():
                 self.inspector_sku_var.set(self.all_skus[0])
                 self.load_sku_into_inspector()
+
+        # Refresh the Budget tab (Total Monthly Budget / Family Split rows)
+        # to match the currently loaded families, and recompute
+        # self.budget_data from it -- falling back to this file's own Budget
+        # tab as defaults the first time, or after loading a file with a
+        # different family set. This intentionally OVERWRITES the plain
+        # Excel-pivot self.budget_data assignment just above, once the
+        # Budget tab has something to say about it.
+        self._sync_budget_tab_with_families()
     
     def load_sample_data(self):
         """Create and load realistic sample data for 100 SKUs"""
@@ -553,6 +888,15 @@ class InventoryOptimizerApp:
         
         self.budget_plot_frame = ttk.Frame(budget_frame)
         self.budget_plot_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Budget (maximum) vs. ALL scenarios, over time, per family
+        budget_ts_frame = ttk.LabelFrame(
+            self.tab_comparison, text="Budget (Maximum) vs. All Scenarios Over Time, by Family", padding="10"
+        )
+        budget_ts_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        self.budget_vs_scenarios_frame = ttk.Frame(budget_ts_frame)
+        self.budget_vs_scenarios_frame.pack(fill=tk.BOTH, expand=True)
         
         # Add stacked comparison
         stacked_comp_frame = ttk.LabelFrame(self.tab_comparison, text="Stacked Comparison All Scenarios", padding="10")
@@ -615,15 +959,30 @@ class InventoryOptimizerApp:
         
         summary = "=== Constraint Scenario Summary ===\n\n"
         summary += f"Optimization completed for {len(scenario['family_projections'])} families\n"
-        summary += "\nOptimized Parameters:\n"
+        summary += (
+            "Budget is treated as a hard MAXIMUM, enforced for every month individually. "
+            "Safety days are optimized on a ROLLING basis (recomputed fresh each month). "
+            "If even minimum safety days can't fit the budget in a given month, supply is "
+            "rationed (cycle stock itself is cut) and the achievable service level drops "
+            "accordingly -- flagged below as 'Supply LIMITED'.\n"
+        )
+        summary += "\nPer-Family Results:\n"
         
         for family, proj in scenario['family_projections'].items():
-            summary += f"\n{family}:\n"
+            achievable = proj.get('achievable_service_level')
+            limited = proj.get('supply_limited', False)
+            achievable_str = f"{achievable:.1%}" if achievable is not None else "n/a"
+            flag = "  \u26a0 Supply LIMITED (budget too tight even at minimum safety days)" if limited else ""
+            summary += f"\n{family}: achievable service level ~{achievable_str}{flag}\n"
             family_skus_list = proj['skus']
             for sku in family_skus_list[:5]:
                 if sku in scenario.get('optimized_params', {}):
-                    safety_days = scenario['optimized_params'][sku]['safety_days']
-                    summary += f"  - {sku}: Safety Days = {safety_days}\n"
+                    params = scenario['optimized_params'][sku]
+                    avg_days = params['safety_days']
+                    schedule = params.get('safety_days_by_month', [])
+                    rng = f" (rolling {min(schedule):.0f}-{max(schedule):.0f})" if schedule else ""
+                    sku_flag = " [rationed]" if params.get('supply_limited') else ""
+                    summary += f"  - {sku}: Safety Days ~{avg_days:.1f}{rng}{sku_flag}\n"
             if len(family_skus_list) > 5:
                 summary += f"  ... and {len(family_skus_list) - 5} more SKUs\n"
         
@@ -688,6 +1047,18 @@ class InventoryOptimizerApp:
             self.scenarios, 
             self.families, 
             self.budget_data, 
+            future_months
+        )
+
+        # Budget (maximum) vs. ALL scenarios, over time, per family -- this is
+        # the "compare the optimal budget against As-Is/Constraint, across all
+        # scenarios" view, on the Comparison tab (not on the Optimized
+        # scenario's own tab).
+        self.visualizer.plot_budget_vs_scenarios_timeseries(
+            self.budget_vs_scenarios_frame,
+            self.scenarios,
+            self.families,
+            self.budget_data,
             future_months
         )
         
@@ -982,6 +1353,19 @@ class InventoryOptimizerApp:
                         
                         if scenario_type == 'optimized':
                             row['Required_Safety_Days'] = proj.get('required_safety_days', 0)
+
+                        if scenario_type == 'constraint':
+                            row['Supply_Limited'] = proj.get('supply_limited', False)
+                            schedule = proj.get('safety_days_by_month')
+                            if schedule:
+                                for i, month in enumerate(future_months):
+                                    if i < len(schedule):
+                                        row[f'Safety_Days_{month}'] = schedule[i]
+                            fill_schedule = proj.get('fill_ratio_by_month')
+                            if fill_schedule:
+                                for i, month in enumerate(future_months):
+                                    if i < len(fill_schedule):
+                                        row[f'Fill_Ratio_{month}'] = fill_schedule[i]
                         
                         sku_data.append(row)
                     
@@ -1004,6 +1388,10 @@ class InventoryOptimizerApp:
                         
                         if scenario_type == 'optimized':
                             row['Required_Budget'] = proj.get('required_budget', 0)
+
+                        if scenario_type == 'constraint':
+                            row['Achievable_Service_Level'] = proj.get('achievable_service_level')
+                            row['Supply_Limited'] = proj.get('supply_limited', False)
                         
                         family_data.append(row)
                     
@@ -1038,11 +1426,17 @@ class InventoryOptimizerApp:
                     if scenario_type == 'constraint' and 'optimized_params' in scenario:
                         params_data = []
                         for sku, params in scenario['optimized_params'].items():
-                            params_data.append({
+                            entry = {
                                 'SKU': sku,
                                 'Family': params['family'],
-                                'Optimized_Safety_Days': params['safety_days']
-                            })
+                                'Avg_Optimized_Safety_Days': params['safety_days'],
+                                'Supply_Limited': params.get('supply_limited', False)
+                            }
+                            schedule = params.get('safety_days_by_month', [])
+                            for i, month in enumerate(future_months):
+                                if i < len(schedule):
+                                    entry[f'Safety_Days_{month}'] = schedule[i]
+                            params_data.append(entry)
                         if params_data:
                             pd.DataFrame(params_data).to_excel(writer, sheet_name="Optimized_Params", index=False)
                     
@@ -1057,6 +1451,22 @@ class InventoryOptimizerApp:
                                 })
                         if budgets_data:
                             pd.DataFrame(budgets_data).to_excel(writer, sheet_name="Required_Budgets", index=False)
+
+                # Export the Budget-tab settings (Total Monthly Budget + Family Split)
+                if self.budget_settings:
+                    budget_settings_rows = []
+                    for m in BUDGET_MONTHS:
+                        budget_settings_rows.append({
+                            'Month': m,
+                            'Total_Budget_EUR': self.budget_settings['monthly_total_eur'].get(m, 0)
+                        })
+                    pd.DataFrame(budget_settings_rows).to_excel(writer, sheet_name="Budget_Total_By_Month", index=False)
+
+                    split_rows = [
+                        {'Family': f, 'Split_Pct': pct}
+                        for f, pct in self.budget_settings['family_split_pct'].items()
+                    ]
+                    pd.DataFrame(split_rows).to_excel(writer, sheet_name="Budget_Family_Split", index=False)
                 
                 # Export settings
                 settings_df = pd.DataFrame([self.settings])

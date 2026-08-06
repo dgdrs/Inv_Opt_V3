@@ -6,6 +6,7 @@ Handles all plotting and visualization
 
 import sys
 import os
+import math
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tkinter as tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -369,6 +370,78 @@ class ScenarioVisualizer:
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
+        return canvas
+
+    def plot_budget_vs_scenarios_timeseries(self, frame, scenarios, families, budget_data, future_months):
+        """Comparison-tab chart: for EVERY family, plot the editable Budget
+        (the % split of the Total Monthly Budget entered on the Budget tab --
+        treated as a MAXIMUM) as a dashed cap line, together with the As-Is,
+        Constraint and Optimized inventory-value lines, across the full
+        Current + 12-month horizon. One subplot per family, so it's a genuine
+        all-scenarios-vs-budget comparison (as opposed to plot_budget_analysis
+        above, which only compares a single last-month snapshot per family).
+        """
+        # Clear previous plot
+        for widget in frame.winfo_children():
+            widget.destroy()
+
+        families = list(families)
+        if not families:
+            return None
+
+        all_months = ['Current'] + list(future_months)
+        n = len(families)
+        ncols = 3 if n > 2 else n
+        nrows = math.ceil(n / ncols)
+
+        fig = plt.Figure(figsize=(5.3 * ncols, 3.7 * nrows), dpi=100)
+
+        scenario_names = {'as_is': 'As-Is', 'constraint': 'Constraint', 'optimized': 'Optimized'}
+        scenario_colors = {'as_is': 'blue', 'constraint': 'green', 'optimized': 'red'}
+        scenario_order = ['as_is', 'constraint', 'optimized']
+
+        axes = []
+        for idx, family in enumerate(families):
+            ax = fig.add_subplot(nrows, ncols, idx + 1)
+            axes.append(ax)
+
+            # Budget (maximum) cap line -- future months only, no "Current" budget
+            if budget_data is not None and family in budget_data.index:
+                budget_values = [
+                    budget_data.loc[family, f'Budget_{m}'] if f'Budget_{m}' in budget_data.columns else np.nan
+                    for m in future_months
+                ]
+                ax.plot(list(future_months), budget_values, color='black', linestyle='--',
+                        linewidth=2, marker='s', markersize=4, label='Budget (max)')
+
+            for scenario_type in scenario_order:
+                scenario = scenarios.get(scenario_type)
+                if not scenario:
+                    continue
+                if family in scenario.get('family_projections', {}):
+                    proj = scenario['family_projections'][family]
+                    values = proj['inventory_value']
+                    ax.plot(all_months[:len(values)], values, marker='o', markersize=3,
+                            linewidth=1.6, color=scenario_colors[scenario_type],
+                            label=scenario_names[scenario_type])
+
+            ax.set_title(str(family), fontsize=10, fontweight='bold')
+            ax.tick_params(axis='x', labelrotation=60, labelsize=7)
+            ax.tick_params(axis='y', labelsize=7)
+            ax.grid(True, alpha=0.3)
+            if idx == 0:
+                ax.legend(fontsize=7, loc='upper left')
+            self._make_interactive(ax)
+
+        fig.suptitle(f"Budget (Maximum) vs. All Scenarios, by Product Family ({self.currency})",
+                     fontsize=13, fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+        # Create canvas
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
         return canvas
     
     def plot_sku_detail(self, frame, sku, sku_result, future_months, existing_canvas=None):

@@ -484,8 +484,45 @@ class InventoryCalculator:
             xyz_class, _ = self._classify_xyz(demand_plan)
             sku_xyz[sku] = xyz_class
             sku_xyz_mult[sku] = self._xyz_multiplier(xyz_class)
+
+        # ROLLING forecast-error sigma: one value per SKU per month, each
+        # computed from the risk-horizon window starting AT THAT MONTH (e.g.
+        # month 5's sigma uses months 5,6 of the Demand Plan, not months
+        # 0,1) -- same idea the Optimized scenario already uses, now applied
+        # to the Constraint scenario too (per the user's request: rolling
+        # safety stock for Constraint, but As-Is stays a fixed "as of now"
+        # snapshot). Precomputed once here since it doesn't depend on the
+        # safety-days decision variables the optimizer below is solving for.
+        sku_sigma_by_month = {}
+        for sku, demand_plan in sku_demand_plan.items():
+            horizon = sku_horizon_months[sku]
+            sku_sigma_by_month[sku] = [
+                self._forecast_error_sigma(
+                    self._demand_over_window(demand_plan, t, horizon), sku_fa[sku], sku_xyz_mult[sku]
+                )
+                for t in range(len(future_months))
+            ]
         
-        # Optimization: For each family, optimize safety days
+        # Optimization: For each family, for EACH MONTH independently, decide
+        # how much TOTAL inventory (cycle stock + safety stock) to hold per
+        # SKU, in EUR-budget terms, to get the best possible sales-weighted
+        # service level without ever exceeding that month's own budget cap.
+        #
+        # This replaces two things at once (see bug report): (1) safety days
+        # is no longer the only lever -- when the budget can't even cover
+        # minimum safety days, the model now rations supply by cutting into
+        # cycle stock itself, rather than silently falling back to an
+        # unconstrained (and budget-violating) result; (2) each month is
+        # optimized against its OWN demand/sigma (rolling), not one fixed
+        # policy applied to all 12 months.
+        #
+        # Because neither the objective nor the budget constraint couples one
+        # month to another (a month's service level and its budget cost only
+        # depend on THAT month's own decision variables), the 12-month joint
+        # problem is mathematically separable into 12 independent, smaller
+        # per-month problems -- solving them one at a time is exact, not an
+        # approximation, and is far faster/more robust than one huge joint
+        # optimization.
         optimized_params = {}
         family_results = {}
         num_families = len(families) or 1
@@ -496,98 +533,191 @@ class InventoryCalculator:
             if not family_skus_list:
                 continue
             
-            # Get budget for this family (average across months)
-            family_budget = 0
+            # TRUE MONTHLY budget cap: this family's own Budget_{month} value
+            # for EVERY month of the horizon (not a single year-average figure).
+            monthly_family_budget = {}
             for month in future_months:
                 budget_col = f'Budget_{month}'
-                if budget_col in budget_data.columns and family in budget_data.index:
-                    family_budget += budget_data.loc[family, budget_col]
-            family_budget /= len(future_months)
-            
-            # Initial safety days
-            initial_safety_days = [sku_params[sku]['safety_days'] for sku in family_skus_list]
-            
-            # Bounds for safety days
-            bounds = Bounds(
-                [self.settings['safety_days_range']['min']] * len(family_skus_list),
-                [self.settings['safety_days_range']['max']] * len(family_skus_list)
-            )
-            
-            # Optimization objective and constraints
-            def budget_constraint(x, month_idx=0):
-                """Calculate total inventory value for a given month"""
-                total_value = 0
-                for i, sku in enumerate(family_skus_list):
-                    demand_col = f'Demand_{future_months[month_idx]}'
-                    demand = data[data['SKU'] == sku][demand_col].iloc[0] if demand_col in data.columns else 0
-                    
-                    daily_demand = demand / 30
-                    safety_stock = daily_demand * x[i]
-                    cycle_stock = demand / 2
-                    
-                    total_inv = safety_stock + cycle_stock
-                    total_value += total_inv * sku_params[sku]['price']
-                
-                return family_budget - total_value
-            
-            def objective(x):
-                """Calculate negative average Cycle Service Level (Sections 6.3, 6.4 & 10)"""
-                total_sl = 0
-                for i, sku in enumerate(family_skus_list):
-                    demand_plan = sku_demand_plan[sku]
-                    # x[i] is a safety-DAYS decision variable; converting it to units
-                    # uses the SKU's average daily demand (a plain unit conversion,
-                    # unrelated to the forecast-error window used for sigma below)
-                    daily_demand = np.mean(demand_plan) / 30 if demand_plan else 0
-                    safety_stock = daily_demand * x[i]
-                    
-                    demand_over_horizon = self._demand_over_window(demand_plan, 0, sku_horizon_months[sku])
-                    sigma = self._forecast_error_sigma(demand_over_horizon, sku_fa[sku], sku_xyz_mult[sku])
-                    
-                    if sigma > 0:
-                        z = safety_stock / sigma
-                        sl = norm.cdf(z)
-                    else:
-                        sl = 1.0
-                    
-                    total_sl += sl
-                
-                return -total_sl / len(family_skus_list)
-            
-            # Solve optimization
-            try:
-                result = minimize(
-                    objective,
-                    initial_safety_days,
-                    method='SLSQP',
-                    bounds=bounds,
-                    constraints=[
-                        {'type': 'ineq', 'fun': lambda x: budget_constraint(x, 0)},
-                        {'type': 'ineq', 'fun': lambda x: budget_constraint(x, len(future_months)//2)},
-                        {'type': 'ineq', 'fun': lambda x: budget_constraint(x, -1)}
-                    ],
-                    options={'maxiter': self.settings['max_iterations']}
+                monthly_family_budget[month] = (
+                    budget_data.loc[family, budget_col]
+                    if budget_col in budget_data.columns and family in budget_data.index
+                    else 0
                 )
-                
-                if result.success:
-                    optimized_safety_days = result.x
-                else:
-                    optimized_safety_days = initial_safety_days
-                    
-            except Exception as e:
-                print(f"Optimization failed for family {family}: {e}")
-                optimized_safety_days = initial_safety_days
             
-            # Store optimized parameters
-            for i, sku in enumerate(family_skus_list):
+            n_skus = len(family_skus_list)
+            prices = np.array([sku_params[sku]['price'] for sku in family_skus_list], dtype=float)
+            min_days = self.settings['safety_days_range']['min']
+            max_days = self.settings['safety_days_range']['max']
+            
+            inv_by_month = {sku: [0.0] * len(future_months) for sku in family_skus_list}
+            
+            for month_idx, month in enumerate(future_months):
+                demand_t = np.array(
+                    [sku_demand_plan[sku][month_idx] if month_idx < len(sku_demand_plan[sku]) else 0.0
+                     for sku in family_skus_list],
+                    dtype=float
+                )
+                sigma_t = np.array([sku_sigma_by_month[sku][month_idx] for sku in family_skus_list], dtype=float)
+                budget_t = monthly_family_budget[month]
+                
+                daily_demand_t = demand_t / 30.0
+                cycle_stock_t = demand_t / 2.0
+                max_safety_stock_t = daily_demand_t * max_days
+                min_safety_stock_t = daily_demand_t * min_days
+                
+                # Decision variable x[i] = TOTAL inventory (units) for SKU i
+                # this month -- NOT safety days. This is what makes rationing
+                # possible: x[i] is allowed down to 0 (see the feasibility
+                # check below), so if the budget can't afford even the
+                # deterministic cycle-stock need, the model can represent
+                # that shortfall directly instead of refusing to solve.
+                upper = cycle_stock_t + max_safety_stock_t
+                preferred_lower = cycle_stock_t + min_safety_stock_t
+                
+                # "Sales weight": how much expected monthly revenue is riding
+                # on this SKU, so scarce budget gets allocated to protect the
+                # highest-value/highest-volume SKUs' service first (the best
+                # achievable outcome for the company's sales under a hard
+                # constraint), rather than spreading the shortfall evenly
+                # across low- and high-value SKUs alike.
+                weights = np.maximum(demand_t * prices, 1e-6)
+                weight_sum = weights.sum()
+                
+                def achievable_service(x, cycle_stock_t=cycle_stock_t, sigma_t=sigma_t):
+                    """Combines (a) the usual uncertainty-buffer Cycle Service
+                    Level (Section 6.3/6.10: norm.cdf(safety_stock / sigma))
+                    with (b) a fill-ratio penalty for any shortfall below the
+                    deterministic cycle-stock need itself -- i.e. being short
+                    of even the EXPECTED demand is worse than just having a
+                    thin safety buffer, and both are reflected in one
+                    'achievable service level' number."""
+                    safety_stock = np.maximum(x - cycle_stock_t, 0.0)
+                    shortfall = np.maximum(cycle_stock_t - x, 0.0)
+                    fill_ratio = np.where(cycle_stock_t > 0, 1.0 - shortfall / np.maximum(cycle_stock_t, 1e-9), 1.0)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        z = np.where(sigma_t > 0, safety_stock / np.where(sigma_t > 0, sigma_t, 1.0), 0.0)
+                    csl = np.where(sigma_t > 0, norm.cdf(z), 1.0)
+                    return csl * fill_ratio
+                
+                def objective(x):
+                    """Negative sales-weighted mean achievable service level
+                    (Sections 6.3, 6.4 & 10, extended with the fill-ratio
+                    penalty above)."""
+                    service = achievable_service(x)
+                    return -float(np.sum(service * weights) / weight_sum)
+                
+                def budget_constraint(x, prices=prices, budget_t=budget_t):
+                    """budget_t minus this month's total inventory VALUE --
+                    the one hard cap this whole optimization exists to
+                    respect."""
+                    return budget_t - float(np.sum(x * prices))
+                
+                constraints = [{'type': 'ineq', 'fun': budget_constraint}]
+                
+                # Phase 1: try to respect the safety_days_range MINIMUM (the
+                # normal "just tune safety days" regime, goal (a)).
+                cost_at_preferred_lower = float(np.sum(preferred_lower * prices))
+                if cost_at_preferred_lower <= budget_t:
+                    lower = preferred_lower
+                else:
+                    # Phase 2: even the minimum safety-days floor doesn't fit
+                    # -- drop it and allow rationing all the way down to 0,
+                    # i.e. eating into cycle stock itself (goal (b): "supply
+                    # must be limited, which affects the achievable service
+                    # level").
+                    lower = np.zeros(n_skus)
+                
+                # Safe (budget-feasible) starting point. IMPORTANT: this must
+                # NOT sit exactly on the `lower` bound corner -- SciPy's SLSQP
+                # has a known quirk where starting exactly on a bound with an
+                # inactive (slack) constraint can report false/premature
+                # convergence after a single iteration, even though a much
+                # better feasible point exists (verified while debugging this
+                # exact bug report: starting at x0=lower=0 with budget fully
+                # unspent returned "success" at iteration 1, spending nothing).
+                # Instead, start from an interior point that already spends
+                # roughly the available budget, proportionally to each SKU's
+                # sales weight -- both avoids the corner and is a sensible
+                # warm start (protect higher-value/volume SKUs first).
+                if budget_t > 0 and prices.sum() > 0:
+                    dollar_alloc = budget_t * weights / weight_sum
+                    x0 = np.clip(dollar_alloc / prices, lower, upper)
+                else:
+                    x0 = lower.copy()
+                
+                bounds = Bounds(lower, np.maximum(upper, lower))
+                
+                try:
+                    result = minimize(
+                        objective, x0, method='SLSQP', bounds=bounds,
+                        constraints=constraints,
+                        options={'maxiter': self.settings['max_iterations']}
+                    )
+                    solution = result.x if result.success else None
+                except Exception as e:
+                    print(f"Rolling optimization failed for family {family}, month {month}: {e}")
+                    solution = None
+                
+                if solution is None:
+                    # Guaranteed-feasible fallback: proportionally scale the
+                    # upper (most-desired) allocation down to fit budget_t,
+                    # rather than silently reporting an over-budget number.
+                    cost_at_upper = float(np.sum(upper * prices))
+                    if cost_at_upper <= budget_t or cost_at_upper <= 0:
+                        solution = upper
+                    else:
+                        solution = upper * (max(budget_t, 0.0) / cost_at_upper)
+                
+                solution = np.clip(solution, 0.0, None)
+                for i, sku in enumerate(family_skus_list):
+                    inv_by_month[sku][month_idx] = float(solution[i])
+            
+            # Derive reportable safety-days / fill-ratio / achieved-service
+            # schedules from the per-month inventory decisions above.
+            for sku in family_skus_list:
+                demand_plan = sku_demand_plan[sku]
+                sigmas = sku_sigma_by_month[sku]
+                inv_units = inv_by_month[sku]
+                
+                safety_days_sched, fill_ratio_sched, achieved_sl_sched = [], [], []
+                for t in range(len(future_months)):
+                    demand_t = demand_plan[t] if t < len(demand_plan) else 0
+                    daily_demand_t = demand_t / 30.0
+                    cycle_stock_t = demand_t / 2.0
+                    x = inv_units[t]
+                    
+                    safety_stock_t = max(x - cycle_stock_t, 0.0)
+                    shortfall_t = max(cycle_stock_t - x, 0.0)
+                    fill_ratio_t = (1.0 - shortfall_t / cycle_stock_t) if cycle_stock_t > 0 else 1.0
+                    days_t = (safety_stock_t / daily_demand_t) if daily_demand_t > 0 else 0.0
+                    sigma_t = sigmas[t] if t < len(sigmas) else 0
+                    csl_t = float(norm.cdf(safety_stock_t / sigma_t)) if sigma_t > 0 else 1.0
+                    
+                    safety_days_sched.append(round(days_t, 1))
+                    fill_ratio_sched.append(round(fill_ratio_t, 4))
+                    achieved_sl_sched.append(round(csl_t * fill_ratio_t, 4))
+                
                 optimized_params[sku] = {
-                    'safety_days': int(round(optimized_safety_days[i])),
-                    'family': family
+                    'family': family,
+                    'inv_units_by_month': inv_units,
+                    'safety_days_by_month': safety_days_sched,
+                    'safety_days': float(np.mean(safety_days_sched)) if safety_days_sched else sku_params[sku]['safety_days'],
+                    'fill_ratio_by_month': fill_ratio_sched,
+                    'achievable_service_by_month': achieved_sl_sched,
+                    'supply_limited': any(r < 0.999 for r in fill_ratio_sched)
                 }
             
-            # Calculate projections with optimized parameters
+            # Calculate projections with optimized (rolling) parameters
             family_projection = self.calculate_family_projection(
                 family, family_skus_list, optimized_params, data, future_months
+            )
+            all_achieved = [
+                v for sku in family_skus_list
+                for v in optimized_params[sku]['achievable_service_by_month']
+            ]
+            family_projection['achievable_service_level'] = float(np.mean(all_achieved)) if all_achieved else None
+            family_projection['supply_limited'] = any(
+                optimized_params[sku]['supply_limited'] for sku in family_skus_list
             )
             family_results[family] = family_projection
             
@@ -614,12 +744,13 @@ class InventoryCalculator:
         }
     
     def calculate_family_projection(self, family, family_skus_list, optimized_params, data, future_months):
-        """Calculate projection for a family with optimized parameters"""
-        demand_data = {}
-        for sku in family_skus_list:
-            row = data[data['SKU'] == sku].iloc[0]
-            demand_data[sku] = [row.get(f'Demand_{m}', 0) for m in future_months]
-        
+        """Calculate projection for a family with optimized (rolling) parameters.
+
+        Uses each SKU's `inv_units_by_month` directly -- the EXACT per-month
+        total-inventory figure the budget-constrained optimizer solved for --
+        rather than recomputing it from a safety-days number. This guarantees
+        the reported family inventory value can never drift from (or exceed)
+        what the optimizer actually targeted."""
         inventory = []
         inventory_value = []
         
@@ -634,24 +765,27 @@ class InventoryCalculator:
         inventory.append(initial_inv)
         inventory_value.append(initial_value)
         
-        # Simplified projection
         for i, month in enumerate(future_months):
             total_inv = 0
             total_value = 0
             
             for sku in family_skus_list:
                 row = data[data['SKU'] == sku].iloc[0]
-                demand = demand_data[sku][i]
                 price = row['Price_EUR']
                 
-                safety_days = optimized_params.get(sku, {}).get('safety_days', row['Safety_Days_of_Supply'])
+                inv_schedule = optimized_params.get(sku, {}).get('inv_units_by_month')
+                if inv_schedule and i < len(inv_schedule):
+                    total_sku_inv = inv_schedule[i]
+                else:
+                    # Fallback (should only trigger if this SKU wasn't part of
+                    # the optimization, e.g. a data inconsistency): old-style
+                    # fixed-safety-days estimate.
+                    demand = row.get(f'Demand_{month}', 0)
+                    safety_days = optimized_params.get(sku, {}).get('safety_days', row['Safety_Days_of_Supply'])
+                    total_sku_inv = (demand / 30) * safety_days + demand / 2
                 
-                daily_demand = demand / 30
-                safety_stock = daily_demand * safety_days
-                cycle_stock = demand / 2
-                
-                total_inv += safety_stock + cycle_stock
-                total_value += (safety_stock + cycle_stock) * price
+                total_inv += total_sku_inv
+                total_value += total_sku_inv * price
             
             inventory.append(total_inv)
             inventory_value.append(total_value)
@@ -663,24 +797,26 @@ class InventoryCalculator:
         }
     
     def extract_sku_projection(self, sku, family_projection, data, future_months, optimized_params, xyz_class=None, xyz_multiplier=1.0):
-        """Extract SKU-level projection from family projection"""
+        """Extract SKU-level projection from family projection, using the
+        optimizer's rolling, budget-feasible-by-construction schedule
+        (inv_units_by_month / safety_days_by_month / achievable_service_by_month
+        from calculate_constraint_scenario) rather than one fixed value."""
         row = data[data['SKU'] == sku].iloc[0]
         family = row['Product_Family']
         price = row['Price_EUR']
         lead_time = row['Production_Leadtime_Days']
         
         demand = [row.get(f'Demand_{m}', 0) for m in future_months]
-        avg_demand = np.mean(demand) if demand else 0
-        
-        fa_columns = [c for c in data.columns if c.startswith('FA_')]
-        fa_values = [row.get(c, 0) for c in fa_columns if row.get(c, 0) > 0]
-        avg_fa = np.mean(fa_values) if fa_values else 0.9
         
         if xyz_class is None:
             xyz_class, _ = self._classify_xyz(demand)
             xyz_multiplier = self._xyz_multiplier(xyz_class)
         
-        safety_days = optimized_params.get(sku, {}).get('safety_days', row['Safety_Days_of_Supply'])
+        params = optimized_params.get(sku, {})
+        inv_schedule = params.get('inv_units_by_month')
+        safety_days_schedule = params.get('safety_days_by_month')
+        achievable_sl_schedule = params.get('achievable_service_by_month')
+        fallback_days = params.get('safety_days', row['Safety_Days_of_Supply'])
         min_order = row.get('Min_Order_Qty', 0)
         
         inventory = []
@@ -690,27 +826,48 @@ class InventoryCalculator:
         inventory.append(current_inv)
         inventory_value.append(current_inv * price)
         
-        daily_demand = 0
+        monthly_safety_stock = []
         for i, month in enumerate(future_months):
-            daily_demand = demand[i] / 30
-            safety_stock = daily_demand * safety_days
-            cycle_stock = demand[i] / 2
+            if inv_schedule and i < len(inv_schedule):
+                total_inv = inv_schedule[i]
+            else:
+                d = demand[i] if i < len(demand) else 0
+                sd = safety_days_schedule[i] if safety_days_schedule and i < len(safety_days_schedule) else fallback_days
+                total_inv = (d / 30) * sd + d / 2
             
-            total_inv = safety_stock + cycle_stock
+            cycle_stock_i = (demand[i] if i < len(demand) else 0) / 2
+            monthly_safety_stock.append(max(total_inv - cycle_stock_i, 0.0))
+            
             inventory.append(total_inv)
             inventory_value.append(total_inv * price)
         
-        avg_daily_demand = avg_demand / 30
-        safety_stock_units = avg_daily_demand * safety_days
         lead_time_months = self._lead_time_months(lead_time)
+        
+        # "Right now" (month 0 of the rolling schedule) snapshot metrics --
+        # answers "what should I reorder to / hold safety stock at RIGHT
+        # NOW", matching how the As-Is scenario reports a point-in-time figure.
+        safety_stock_now = monthly_safety_stock[0] if monthly_safety_stock else 0
+        
+        # Achieved service level: the AVERAGE of the rolling, budget-aware
+        # achievable-service figures (Cycle Service Level combined with any
+        # supply-rationing fill-ratio penalty -- see calculate_constraint_scenario)
+        # across the full 12-month horizon, i.e. "the theoretically achievable
+        # service level per family/SKU under the constraint."
+        if achievable_sl_schedule:
+            expected_service_level = float(np.mean(achievable_sl_schedule))
+        else:
+            expected_service_level = self._achieved_service_level(safety_stock_now, demand, 0, 0.9, lead_time, xyz_multiplier)
+        
+        avg_safety_days = float(np.mean(safety_days_schedule)) if safety_days_schedule else fallback_days
+        supply_limited = params.get('supply_limited', False)
         
         return {
             'inventory': inventory,
             'inventory_value': inventory_value,
             'demand': demand,
-            'safety_stock': safety_stock_units,
-            'reorder_point': self._reorder_point(demand, 0, lead_time_months, safety_stock_units),
-            'expected_service_level': self._achieved_service_level(safety_stock_units, demand, 0, avg_fa, lead_time, xyz_multiplier),
+            'safety_stock': safety_stock_now,
+            'reorder_point': self._reorder_point(demand, 0, lead_time_months, safety_stock_now),
+            'expected_service_level': expected_service_level,
             'target_service_level': self.settings['default_service_levels'].get(row['ABC_Classification'], 0.95),
             'price': price,
             'family': family,
@@ -718,7 +875,11 @@ class InventoryCalculator:
             'xyz': xyz_class,
             'min_order_qty': min_order,
             'lead_time': lead_time,
-            'safety_days': safety_days
+            'safety_days': avg_safety_days,
+            'safety_days_by_month': safety_days_schedule if safety_days_schedule else [fallback_days] * len(future_months),
+            'fill_ratio_by_month': params.get('fill_ratio_by_month'),
+            'achievable_service_by_month': achievable_sl_schedule,
+            'supply_limited': supply_limited
         }
     
     def calculate_optimized_scenario(self, data, families, family_skus):
